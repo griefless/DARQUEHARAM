@@ -249,7 +249,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-
       <p style="margin-top:6px;">
         <strong>Step 7 — Export:</strong> Download the full report as <strong>PDF</strong> or <strong>Word document (.docx)</strong>, or export as CSV.
       </p>
-      <p style="margin-top:8px;color:var(--amber);">Set <code>SERPER_API_KEY</code> and optionally <code>FLARESOLVERR_URL</code> in Netlify environment variables.</p>
+      <p style="margin-top:8px;color:var(--green);">✅ API keys are hardcoded for static deployment. No server or environment variables needed. Serper &amp; FlareSolverr are called directly from your browser.</p>
     </details>
   </div>
 
@@ -347,10 +347,10 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-
       <li>Labour rates from MBSA, BIBC, CETA &amp; Dept of Labour</li>
       <li>Export: Download full report as PDF or Word document (.docx)</li>
     </ul>
-    <p style="margin-top:12px;"><strong>Environment Variables:</strong></p>
+    <p style="margin-top:12px;"><strong>API Configuration (Hardcoded — Static Deployment):</strong></p>
     <ul>
-      <li><code>SERPER_API_KEY</code> — Required. Free key from serper.dev</li>
-      <li><code>FLARESOLVERR_URL</code> — Optional. FlareSolverr instance URL</li>
+      <li>✅ <code>SERPER_API_KEY</code> — Hardcoded. Calls Google ZA search via serper.dev</li>
+      <li>✅ <code>FLARESOLVERR_URL</code> — Hardcoded. Cloudflare bypass via your FlareSolverr instance</li>
     </ul>
   </div>
 </div>
@@ -997,6 +997,12 @@ function parseBOQFile(file) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+//  CONFIGURATION — API keys hardcoded for static deployment
+// ═══════════════════════════════════════════════════════════════════════════════
+const SERPER_API_KEY = 'c518ff4a57f3041a4a91004e592ff3d1387f6978';
+const FLARESOLVERR_URL = 'https://flaresolverr-latest-l9bk.onrender.com';
+
+// ═══════════════════════════════════════════════════════════════════════════════
 //  SEARCH & API
 // ═══════════════════════════════════════════════════════════════════════════════
 function buildSearchQuery(item) {
@@ -1009,11 +1015,158 @@ function buildSearchQuery(item) {
   return query.trim();
 }
 
+function extractDomainName(url) {
+  try {
+    const hostname = new URL(url).hostname.replace(/^www\./, '');
+    const parts = hostname.split('.');
+    const name = parts[0];
+    return name.charAt(0).toUpperCase() + name.slice(1);
+  } catch (e) { return 'Supplier'; }
+}
+
+function extractPriceFromJsonLd(obj) {
+  if (!obj || typeof obj !== 'object') return null;
+  const candidates = [];
+  const check = (o) => {
+    if (!o || typeof o !== 'object') return;
+    if (o.price !== undefined) {
+      const p = parseFloat(String(o.price).replace(/[^\d.]/g, ''));
+      if (p > 0.5 && p < 500000) candidates.push(p);
+    }
+    if (o.offers) { const arr = Array.isArray(o.offers) ? o.offers : [o.offers]; arr.forEach(check); }
+    if (Array.isArray(o)) o.forEach(check);
+  };
+  check(obj);
+  return candidates.length ? Math.min(...candidates) : null;
+}
+
+function extractPriceFromText(text) {
+  if (!text) return null;
+  const prices = [];
+  const patterns = [
+    /R\s*(\d[\d\s]*(?:[.,]\d{1,2})?)/g,
+    /ZAR\s*(\d[\d\s]*(?:[.,]\d{1,2})?)/g,
+    /"price"\s*:\s*"?(\d+(?:\.\d{1,2})?)"/gi,
+    /data-price="(\d+(?:\.\d{1,2})?)"/gi,
+    /class="price[^"]*"[^>]*>R?\s*(\d[\d\s,.]*)(?:\s*<)/gi,
+  ];
+  for (const pat of patterns) {
+    let m;
+    const re = new RegExp(pat.source, pat.flags);
+    while ((m = re.exec(text)) !== null) {
+      const raw = m[1].replace(/\s/g, '').replace(',', '.');
+      const val = parseFloat(raw);
+      if (val > 0.5 && val < 500000) prices.push(val);
+    }
+  }
+  if (!prices.length) return null;
+  prices.sort((a, b) => a - b);
+  const median = prices[Math.floor(prices.length / 2)];
+  return median;
+}
+
+function extractPriceFromHTML(html) {
+  // Strategy 1: JSON-LD structured data
+  const jsonLdRe = /<script[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi;
+  let match;
+  while ((match = jsonLdRe.exec(html)) !== null) {
+    try {
+      const parsed = JSON.parse(match[1].trim());
+      const price = extractPriceFromJsonLd(parsed);
+      if (price) return price;
+    } catch (e) {}
+  }
+  // Strategy 2: Meta price tags
+  const metaRe = /<meta[^>]*(?:itemprop|property)=["'](?:price|og:price:amount|product:price:amount)["'][^>]*content=["']([^"']+)["']/gi;
+  while ((match = metaRe.exec(html)) !== null) {
+    const val = parseFloat(match[1].replace(/[^\d.]/g, ''));
+    if (val > 0.5 && val < 500000) return val;
+  }
+  // Strategy 3: ZAR regex in page text
+  return extractPriceFromText(html);
+}
+
+async function fetchViaFlareSolverr(targetUrl) {
+  const res = await fetch(`${FLARESOLVERR_URL}/v1`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ cmd: 'request.get', url: targetUrl, maxTimeout: 30000 })
+  });
+  if (!res.ok) throw new Error(`FlareSolverr HTTP ${res.status}`);
+  const data = await res.json();
+  return data?.solution?.response || '';
+}
+
+async function extractPriceFromUrl(url, snippet) {
+  // First: try snippet (always available, no network cost)
+  const snippetPrice = extractPriceFromText(snippet || '');
+  if (snippetPrice) return { price: snippetPrice, estimated: true };
+
+  // Try FlareSolverr first (bypasses Cloudflare)
+  try {
+    const html = await fetchViaFlareSolverr(url);
+    if (html) {
+      const price = extractPriceFromHTML(html);
+      if (price) return { price, estimated: false };
+    }
+  } catch (e) {}
+
+  // Direct fetch as fallback (works for non-Cloudflare sites)
+  try {
+    const res = await fetch(url, { mode: 'cors', signal: AbortSignal.timeout(8000) });
+    if (res.ok) {
+      const html = await res.text();
+      const price = extractPriceFromHTML(html);
+      if (price) return { price, estimated: false };
+    }
+  } catch (e) {}
+
+  return null;
+}
+
 async function searchPrices(query) {
-  const url = `/.netlify/functions/search-prices?action=search&q=${encodeURIComponent(query)}`;
-  const res = await fetch(url);
-  if (!res.ok) { const err = await res.json().catch(() => ({})); throw new Error(err.error || `HTTP ${res.status}`); }
-  return res.json();
+  // Call Serper (Google Search API) directly from browser
+  const serperRes = await fetch('https://google.serper.dev/search', {
+    method: 'POST',
+    headers: {
+      'X-API-KEY': SERPER_API_KEY,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({ q: query, gl: 'za', hl: 'en', num: 10 })
+  });
+  if (!serperRes.ok) throw new Error(`Serper API error: ${serperRes.status}`);
+  const serperData = await serperRes.json();
+
+  const organic = serperData.organic || [];
+  const suppliers = [];
+
+  // Fetch prices from top results (up to 7, in parallel batches of 3)
+  const batch = organic.slice(0, 7);
+  for (let i = 0; i < batch.length; i += 3) {
+    const chunk = batch.slice(i, i + 3);
+    const results = await Promise.allSettled(
+      chunk.map(r => extractPriceFromUrl(r.link, r.snippet))
+    );
+    results.forEach((res, idx) => {
+      const r = chunk[idx];
+      if (res.status === 'fulfilled' && res.value) {
+        suppliers.push({
+          name: extractDomainName(r.link),
+          price: res.value.price,
+          url: r.link,
+          _estimated: res.value.estimated
+        });
+      }
+    });
+  }
+
+  // Sort ascending by price; estimated last
+  suppliers.sort((a, b) => {
+    if (a._estimated !== b._estimated) return a._estimated ? 1 : -1;
+    return a.price - b.price;
+  });
+
+  return { suppliers: suppliers.slice(0, 5), sources: organic.length };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1597,4 +1750,3 @@ document.addEventListener('DOMContentLoaded', () => { updateStatus('Ready'); });
 </script>
 </body>
 </html>
-
